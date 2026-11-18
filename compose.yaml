@@ -1,0 +1,18 @@
+services:
+  db:
+    # Multi-arch PostGIS image (also runs on ARM machines; the official postgis/postgis is amd64-only)
+    image: imresamu/postgis:17-3.5
+    environment:
+      POSTGRES_DB: nightout
+      POSTGRES_USER: nightout
+      POSTGRES_PASSWORD: nightout
+    ports:
+      - "5433:5432"   # 5433 on your PC, in case another Postgres already uses 5432
+    volumes:
+      - nightout-db:/var/lib/postgresql/data
+    labels:
+      # Tells Spring Boot this is a Postgres database it can connect to
+      org.springframework.boot.service-connection: postgres
+
+volumes:
+  nightout-db:

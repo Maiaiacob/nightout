@@ -1,0 +1,20 @@
+spring:
+  application:
+    name: nightout
+  # No datasource URL here: in development, spring-boot-docker-compose starts compose.yaml
+  # and connects automatically. When deployed, set SPRING_DATASOURCE_URL / _USERNAME / _PASSWORD.
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate   # Flyway owns the schema (src/main/resources/db/migration)
+    show-sql: false
+
+nightout:
+  ticketmaster:
+    base-url: https://app.ticketmaster.com/discovery/v2
+    api-key: ${TICKETMASTER_API_KEY:}
+  nominatim:
+    base-url: https://nominatim.openstreetmap.org
+    user-agent: NightoutStudentProject/0.1 (maia.aniela@gmail.com)
+  overpass:
+    base-url: https://overpass.private.coffee/api

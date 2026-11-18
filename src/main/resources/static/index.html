@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Nightout</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+    <style>
+        * { box-sizing: border-box; }
+        body { margin: 0; font-family: system-ui, sans-serif; background: #111; color: #eee; }
+        header { padding: 16px; display: flex; gap: 12px; align-items: center; background: #1c1c28; flex-wrap: wrap; }
+        header h1 { margin: 0 12px 0 0; font-size: 22px; }
+        input[type=text] { padding: 10px; font-size: 16px; border-radius: 6px; border: none; width: 240px; }
+        select { padding: 10px; font-size: 15px; border-radius: 6px; border: none; }
+        button { padding: 10px 18px; font-size: 16px; border-radius: 6px; border: none;
+            background: #8a5cf6; color: white; cursor: pointer; }
+        button:disabled { opacity: .5; }
+        label { font-size: 14px; color: #ccc; cursor: pointer; }
+        main { display: grid; grid-template-columns: 380px 1fr; height: calc(100vh - 68px); }
+        #side { display: flex; flex-direction: column; min-height: 0; }
+        #list { overflow-y: auto; padding: 12px; flex: 1; }
+        #filters { padding: 12px 12px 0; display: flex; flex-direction: column; gap: 8px; }
+        #nameSearch { padding: 8px 10px; font-size: 14px; border-radius: 6px; border: none; width: 100%; }
+        #typeChips, #genreChips { display: flex; flex-wrap: wrap; gap: 6px; }
+        .chip { padding: 5px 10px; font-size: 13px; border-radius: 999px;
+            background: #2a2a3c; color: #ccc; border: 1px solid #3a3a50; }
+        .chip.active { background: #8a5cf6; color: #fff; border-color: #8a5cf6; } #map { height: 100%; }
+        h2 { font-size: 16px; color: #aaa; margin: 16px 0 8px; }
+        .card { background: #1c1c28; padding: 10px 12px; border-radius: 8px; margin-bottom: 8px; cursor: pointer; }
+        .card:hover { background: #2a2a3c; }
+        .card .meta { font-size: 13px; color: #999; }
+        .card a { color: #b49bff; font-size: 13px; }
+        .open { color: #4ade80 !important; } .closed { color: #f87171 !important; } .unknown { color: #888; }
+        #status { color: #aaa; font-size: 14px; }
+        .card img.event-img { width: 100%; height: 120px; object-fit: cover; border-radius: 6px; margin-bottom: 6px; display: block; }
+        .filter-label { font-size: 12px; color: #888; }
+        .card.chosen { outline: 2px solid #8a5cf6; }
+        .plan-btn { margin-top: 6px; }
+    </style>
+</head>
+<body>
+<header>
+    <h1>🌙 Nightout</h1>
+    <input type="text" id="city" placeholder="Which city are you in?" autofocus>
+    <button id="go">Search</button>
+    <button id="nearMe" title="Use my location">📍 Near me</button>
+    <select id="radius" style="display:none">
+        <option value="500">500 m</option>
+        <option value="1000" selected>1 km</option>
+        <option value="2000">2 km</option>
+        <option value="5000">5 km</option>
+        <option value="10000">10 km</option>
+    </select>
+    <label title="Checked by the server, from the bar's opening hours"><input type="checkbox" id="openNowOnly"> Open now</label>
+    <label><input type="checkbox" id="onlyOpen"> Open tonight </label>
+    <span id="status"></span>
+</header>
+<main>
+    <div id="side">
+        <div id="filters" style="display:none">
+            <input type="text" id="nameSearch" placeholder="🔍 Find a bar by name…">
+            <div class="filter-label">🎟️ Event genres</div>
+            <div id="genreChips"></div>
+            <div class="filter-label">🍻 Place types</div>
+            <div id="typeChips"></div>
+        </div>
+        <div id="list"></div>
+    </div>
+    <div id="map"></div>
+</main>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://openingh.openstreetmap.de/opening_hours.js/opening_hours+deps.min.js"></script>
+<script>
+    // Map
+    const map = L.map('map').setView([52.37, 4.90], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+    const markers = L.layerGroup().addTo(map);
+    let current = null;   //last search result
+
+    // Helpers
+    const lat = o => o?.latitude ?? o?.lat;
+    const lon = o => o?.longitude ?? o?.lon;
+    const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+    const hhmm = d => d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+
+    // Opening hours
+    // "Tonight"=from 18:00 (or now) until 06:00 the next morning
+    function tonightWindow() {
+        const now = new Date();
+        const start = new Date(now), end = new Date(now);
+        if (now.getHours() >= 6) {
+            end.setDate(end.getDate() + 1);
+            if (now.getHours() < 18) start.setHours(18, 0, 0, 0);
+        }
+        end.setHours(6, 0, 0, 0);
+        return [start, end];
+    }
+
+    function tonightStatus(v) {
+        if (!v.openingHours) return {state: 'unknown', label: 'Hours unknown'};
+        try {
+            const oh = new opening_hours(v.openingHours, null, 0);
+            const [from, to] = tonightWindow();
+            const intervals = oh.getOpenIntervals(from, to);
+            if (intervals.length === 0) return {state: 'closed', label: 'Closed tonight'};
+            const opens = intervals[0][0], closes = intervals[intervals.length - 1][1];
+            const untilText = closes.getTime() >= to.getTime() ? 'late' : hhmm(closes);
+            const fromText = opens > new Date() ? `from ${hhmm(opens)} ` : '';
+            return {state: 'open', label: `Open ${fromText}until ${untilText}`};
+        } catch (e) {
+            return {state: 'unknown', label: 'Hours unclear'};
+        }
+    }
+
+    function nowLine(v) {
+        if (v.openNow === true) {
+            return `<div class="meta open">🟢 Open now${v.openUntil ? ' · until ' + esc(v.openUntil) : ''}</div>`;
+        }
+        if (v.openNow === false && v._tonight.state === 'closed') return `<div class="meta closed">Closed tonight</div>`;
+        if (v.openNow === false) {
+            const later = v._tonight.state === 'open' ? `<div class="meta open">${esc(v._tonight.label)}</div>` : '';
+            return `<div class="meta closed">Closed now</div>${later}`;
+        }
+        return `<div class="meta ${v._tonight.state}">${esc(v._tonight.label)}</div>`;
+    }
+
+    // Hover on photos
+    // Same status as in the list(plain text)
+    function statusText(v) {
+        if (v.openNow === true) return 'Open now' + (v.openUntil ? ' · until ' + v.openUntil : '');
+        if (v.openNow === false) return v._tonight.state === 'open' ? 'Closed now · ' + v._tonight.label : 'Closed now';
+        return v._tonight.label;
+    }
+
+    function tooltipHtml(v, label = statusText(v)) {
+        const img = v.imageUrl
+            ? `<img src="${esc(v.imageUrl)}" style="width:200px;height:130px;object-fit:cover;display:block;margin-bottom:4px;border-radius:4px">`
+            : '';
+        return `${img}<b>${esc(v.name)}</b><br>${esc(label)}`;
+    }
+
+    async function loadWikidataPhoto(v) {
+        if (v.imageUrl || !v.wikidata || v._wdChecked) return;
+        v._wdChecked = true;
+        try {
+            const res = await fetch('https://www.wikidata.org/w/api.php?action=wbgetclaims&property=P18&format=json&origin=*&entity='
+                + encodeURIComponent(v.wikidata));
+            const json = await res.json();
+            const file = json.claims?.P18?.[0]?.mainsnak?.datavalue?.value;
+            if (file) {
+                v.imageUrl = 'https://commons.wikimedia.org/wiki/Special:FilePath/'
+                    + encodeURIComponent(file.replace(/ /g, '_')) + '?width=300';
+                v._marker.setTooltipContent(tooltipHtml(v));
+            }
+        } catch (e) { /* no photo, that's fine */ }
+    }
+
+    // Near me function
+    let me = null;        // coord. of the user,or null
+    let nearby = null;    // venues around the user
+    let meLayer = null;
+
+    function distanceM(aLat, aLon, bLat, bLon) {
+        const R = 6371000, toRad = d => d * Math.PI / 180;
+        const dLat = toRad(bLat - aLat), dLon = toRad(bLon - aLon);
+        const h = Math.sin(dLat / 2) ** 2 +
+            Math.cos(toRad(aLat)) * Math.cos(toRad(bLat)) * Math.sin(dLon / 2) ** 2;
+        return 2 * R * Math.asin(Math.sqrt(h));
+    }
+
+    function fmtDist(m) {
+        return m < 1000 ? `${Math.round(m / 10) * 10} m away` : `${(m / 1000).toFixed(1)} km away`;
+    }
+
+    function getPosition() {
+        return new Promise((resolve, reject) =>
+            navigator.geolocation.getCurrentPosition(
+                p => resolve({lat: p.coords.latitude, lon: p.coords.longitude}),
+                reject,
+                {enableHighAccuracy: true, timeout: 10000}));
+    }
+
+    function radius() { return Number(document.getElementById('radius').value); }
+
+    function showMe() {
+        if (meLayer) meLayer.remove();
+        const layers = [L.circleMarker([me.lat, me.lon], {radius: 8, color: '#fff', weight: 2,
+            fillColor: '#3b82f6', fillOpacity: 1}).bindTooltip('You are here')];
+        if (radius()) layers.push(L.circle([me.lat, me.lon], {radius: radius(), color: '#8a5cf6', weight: 1, fillOpacity: 0.06}));
+        meLayer = L.layerGroup(layers).addTo(map);
+    }
+
+    // Bars around the user
+    async function loadNearby() {
+        const openNow = document.getElementById('openNowOnly').checked;
+        const res = await fetch(`/api/venues/nearby?lat=${me.lat}&lng=${me.lon}&radius=${radius()}&open=${openNow}`);
+        if (!res.ok) throw new Error('Server answered ' + res.status);
+        nearby = await res.json();
+        nearby.forEach(v => { v._tonight = tonightStatus(v); v._dist = v.distanceMeters; });
+    }
+
+    function clearMe() {
+        me = null;
+        nearby = null;
+        if (meLayer) { meLayer.remove(); meLayer = null; }
+        document.getElementById('radius').style.display = 'none';   //hide the distance menu before pressing "Near me"
+    }
+
+    async function nearMe() {
+        const status = document.getElementById('status');
+        if (!navigator.geolocation) { status.textContent = 'Your browser cannot share your location.'; return; }
+
+        status.textContent = 'Finding your location…';
+        try {
+            me = await getPosition();
+        } catch (e) {
+            status.textContent = 'Could not get your location (did you allow it?)';
+            return;
+        }
+
+        const nearest = current
+            ? Math.min(...current.venues.filter(v => lat(v) != null)
+                .map(v => distanceM(me.lat, me.lon, lat(v), lon(v))))
+            : Infinity;
+        if (nearest > 10000) {
+            status.textContent = 'Finding out which city you are in…';
+            try {
+                const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&zoom=10&lat=${me.lat}&lon=${me.lon}`);
+                const a = (await res.json()).address || {};
+                const city = a.city || a.town || a.village || a.municipality;
+                if (!city) { status.textContent = 'Could not find a city at your location.'; return; }
+                document.getElementById('city').value = city;
+                await search();
+            } catch (e) {
+                status.textContent = 'Could not find your city: ' + e.message;
+                return;
+            }
+        }
+
+        document.getElementById('radius').style.display = '';
+        showMe();
+        status.textContent = 'Finding places near you…';
+        try {
+            await loadNearby();
+        } catch (e) {
+            status.textContent = 'Could not load places near you: ' + e.message;
+            return;
+        }
+        draw();
+        const r = radius();
+        map.setView([me.lat, me.lon], r <= 500 ? 16 : r <= 1000 ? 15 : r <= 2000 ? 14 : r <= 5000 ? 13 : 12);
+    }
+
+    // Type + name filter
+    let activeTypes = new Set();
+    const norm = s => String(s ?? '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+
+    function buildTypeChips() {
+        activeTypes.clear();
+        document.getElementById('nameSearch').value = '';
+
+        const counts = {};
+        current.venues.forEach(v => { if (v.type) counts[v.type] = (counts[v.type] || 0) + 1; });
+        const types = Object.keys(counts).sort((a, b) => counts[b] - counts[a]);   //most common first
+
+        const box = document.getElementById('typeChips');
+        box.innerHTML = types.map(t =>
+            `<button class="chip" data-type="${esc(t)}">${esc(t)} (${counts[t]})</button>`).join('');
+
+        box.querySelectorAll('.chip').forEach(chip => {
+            chip.onclick = () => {
+                const t = chip.dataset.type;
+                if (activeTypes.has(t)) activeTypes.delete(t); else activeTypes.add(t);
+                chip.classList.toggle('active');
+                draw();
+            };
+        });
+        document.getElementById('filters').style.display = '';
+    }
+
+    // Genre filter for events
+    let activeGenres = new Set();
+    const genreOf = e => e.genre || e.category || 'Other';
+
+    function buildGenreChips() {
+        activeGenres.clear();
+        const counts = {};
+        current.events.forEach(e => { const g = genreOf(e); counts[g] = (counts[g] || 0) + 1; });
+        const genres = Object.keys(counts).sort((a, b) => counts[b] - counts[a]);
+
+        const box = document.getElementById('genreChips');
+        box.innerHTML = genres.length
+            ? genres.map(g => `<button class="chip" data-genre="${esc(g)}">${esc(g)} (${counts[g]})</button>`).join('')
+            : '<span class="filter-label">No events tonight</span>';
+
+        box.querySelectorAll('.chip').forEach(chip => {
+            chip.onclick = () => {
+                const g = chip.dataset.genre;
+                if (activeGenres.has(g)) activeGenres.delete(g); else activeGenres.add(g);
+                chip.classList.toggle('active');
+                draw();
+            };
+        });
+    }
+
+    // Plan my night
+    let plan = null;   //shows the plan instead of the normal list
+
+    //find the venue of an event
+    function eventVenue(e) {
+        return current.venues.find(v => v.id != null && v.id === e.venueId)
+            || current.venues.find(v => norm(v.name) === norm(e.venueName));
+    }
+
+    //assume events lasts 2.5 hours
+    function eventEnd(e) {
+        if (e.endTime) return new Date(e.endTime);
+        const end = new Date(e.startTime);
+        end.setMinutes(end.getMinutes() + 150);
+        return end;
+    }
+
+    function statusAt(v, date) {
+        if (!v.openingHours) return {state: 'unknown'};
+        try {
+            const oh = new opening_hours(v.openingHours, null, 0);
+            if (!oh.getState(date)) return {state: 'closed'};
+            return {state: 'open', until: oh.getNextChange(date)};   //undefined=no closing time known
+        } catch (e) {
+            return {state: 'unknown'};
+        }
+    }
+
+    function planNight(e) {
+        const venue = eventVenue(e);
+        const status = document.getElementById('status');
+        if (!venue || lat(venue) == null) { status.textContent = 'This event has no location on the map, so I can\'t plan around it.'; return; }
+
+        const end = eventEnd(e);
+        const candidates = r => current.venues
+            .filter(v => v !== venue && v.type !== 'Live music venue' && lat(v) != null)
+            .map(v => ({v, dist: distanceM(lat(venue), lon(venue), lat(v), lon(v)), at: statusAt(v, end)}))
+            .filter(o => o.dist <= r && o.at.state !== 'closed')
+            .sort((a, b) => (a.at.state === 'open' ? 0 : 1) - (b.at.state === 'open' ? 0 : 1) || a.dist - b.dist)
+            .slice(0, 8);
+
+        let options = [], radius = 500;
+        for (const r of [500, 1000, 2000]) {
+            radius = r;
+            options = candidates(r);
+            if (options.length) break;
+        }
+
+        plan = {event: e, venue, end, options, radius, chosen: 0};
+        drawPlan();
+    }
+
+    function drawPlan() {
+        const {event: e, venue, end, options, radius} = plan;
+        const list = document.getElementById('list');
+        markers.clearLayers();
+
+        const evLL = [lat(venue), lon(venue)];
+        L.circleMarker(evLL, {radius: 10, color: '#fff', weight: 2, fillColor: '#f43f5e', fillOpacity: 1})
+            .bindTooltip('🎟️ ' + e.name).addTo(markers);
+
+        const distText = radius === 500 ? 'within 500 m' : `nothing within 500 m, showing up to ${radius / 1000} km`;
+        let html = `<button id="backBtn" class="chip">← Back</button>
+                    <h2>🌙 Your night</h2>
+                    <div class="card">
+                        ${e.imageUrl ? `<img class="event-img" src="${esc(e.imageUrl)}" alt="">` : ''}
+                        <strong>1. ${esc(e.name)}</strong>
+                        <div class="meta">${hhmm(new Date(e.startTime))} – ~${hhmm(end)} · ${esc(venue.name)}</div>
+                    </div>
+                    <h2>2. Then a drink nearby (${distText})</h2>`;
+
+        if (options.length === 0) html += '<p class="meta">No bars found that are open after this event.</p>';
+
+        options.forEach((o, i) => {
+            const walk = Math.max(1, Math.round(o.dist / 80));
+            const hours = o.at.state === 'open'
+                ? (o.at.until ? `Open until ${hhmm(o.at.until)}` : 'Open late')
+                : 'Hours unknown';
+            const route = `https://www.openstreetmap.org/directions?engine=fossgis_osrm_foot&route=${lat(venue)}%2C${lon(venue)}%3B${lat(o.v)}%2C${lon(o.v)}`;
+            html += `<div class="card ${i === plan.chosen ? 'chosen' : ''}" data-o="${i}">
+                        <strong>${esc(o.v.name)}</strong>
+                        <div class="meta">${esc(o.v.type)} · 🚶 ${walk} min (${fmtDist(o.dist).replace(' away', '')})</div>
+                        <div class="meta ${o.at.state}">${hours}</div>
+                        ${i === plan.chosen ? `<a href="${route}" target="_blank">Walking route →</a>` : ''}
+                     </div>`;
+
+            o.marker = L.marker([lat(o.v), lon(o.v)], {opacity: i === plan.chosen ? 1 : 0.6})
+                .bindTooltip(tooltipHtml(o.v, hours), {direction: 'top', offset: [0, -12]})
+                .addTo(markers);
+            o.marker.on('click', () => { plan.chosen = i; drawPlan(); });
+        });
+
+        const chosen = options[plan.chosen];
+        if (chosen) {
+            L.polyline([evLL, [lat(chosen.v), lon(chosen.v)]], {color: '#8a5cf6', weight: 4, dashArray: '8 8'}).addTo(markers);
+        }
+        map.fitBounds([evLL, ...options.map(o => [lat(o.v), lon(o.v)])], {padding: [40, 40], maxZoom: 17});
+
+        list.innerHTML = html;
+        list.scrollTop = 0;
+        document.getElementById('backBtn').onclick = () => { plan = null; draw(); };
+        list.querySelectorAll('.card[data-o]').forEach(card => {
+            card.onclick = () => { plan.chosen = Number(card.dataset.o); drawPlan(); };
+        });
+        document.getElementById('status').textContent = `Plan: ${e.name} → ${options.length} bars nearby`;
+    }
+
+    // Search
+    let barsTimer = null;   //checks again while the bars are still loading in the background
+
+    function fitMapToResult() {
+        const points = current.venues.filter(v => lat(v) != null).map(v => [lat(v), lon(v)]);
+        if (points.length) map.fitBounds(points, {maxZoom: 15});
+        else if (lat(current.city) != null) map.setView([lat(current.city), lon(current.city)], 14);
+    }
+
+    //the server loads the bars of a new city in the background.
+    function waitForBars(city, tries = 0) {
+        const status = document.getElementById('status');
+        status.textContent = '🍻 Loading bars… the events are already shown (this can take a minute on busy nights)';
+        barsTimer = setTimeout(async () => {
+            try {
+                const res = await fetch('/api/nightout?city=' + encodeURIComponent(city));
+                if (!res.ok) return;
+                const data = await res.json();
+                if (!current || current.city?.id !== data.city?.id) return;
+                if (data.venuesLoading && tries < 40) { waitForBars(city, tries + 1); return; }
+                current.venues = data.venues;
+                current.venues.forEach(v => v._tonight = tonightStatus(v));
+                buildTypeChips();
+                fitMapToResult();
+                draw();
+                if (data.venues.length === 0) {
+                    status.textContent = 'Could not load the bars right now, the free map servers are busy. Try again in a few minutes.';
+                }
+            } catch (e) { /* try again on the next search */ }
+        }, 5000);
+    }
+
+    async function search() {
+        const city = document.getElementById('city').value.trim();
+        if (!city) return;
+        clearTimeout(barsTimer);
+        const btn = document.getElementById('go');
+        const status = document.getElementById('status');
+        btn.disabled = true;
+        status.textContent = 'Searching… (a new city can take a few seconds)';
+        try {
+            const res = await fetch('/api/nightout?city=' + encodeURIComponent(city));
+            if (!res.ok) throw new Error('Server answered ' + res.status);
+            current = await res.json();
+            plan = null;
+            current.venues.forEach(v => v._tonight = tonightStatus(v));
+            buildTypeChips();
+            buildGenreChips();
+
+            fitMapToResult();
+
+            draw();
+            if (current.venuesLoading) waitForBars(city);
+        } catch (e) {
+            status.textContent = 'Something went wrong: ' + e.message;
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
+    // Draw list + map
+    function draw() {
+        if (!current) return;
+        if (plan) { drawPlan(); return; }
+        const onlyOpen = document.getElementById('onlyOpen').checked;
+        //near me: the server's list, otherwise: the whole city.
+        let venues = (me && nearby ? nearby : current.venues).filter(v => !onlyOpen || v._tonight.state !== 'closed');
+        if (document.getElementById('openNowOnly').checked) venues = venues.filter(v => v.openNow === true);
+        if (activeTypes.size) venues = venues.filter(v => activeTypes.has(v.type));
+        const q = norm(document.getElementById('nameSearch').value.trim());
+        if (q) venues = venues.filter(v => norm(v.name).includes(q));
+        const list = document.getElementById('list');
+        markers.clearLayers();
+        const events = current.events.filter(e => !activeGenres.size || activeGenres.has(genreOf(e)));
+
+        let html = '<h2>🎟️ Tonight\'s events</h2>';
+        if (events.length === 0) html += '<p class="meta">No events found for tonight.</p>';
+        events.forEach((e, i) => {
+            const time = e.startTime ? hhmm(new Date(e.startTime)) : '';
+            const genre = [e.category, e.genre].filter(Boolean).join(' / ');
+            html += `<div class="card">
+                        ${e.imageUrl ? `<img class="event-img" src="${esc(e.imageUrl)}" alt="">` : ''}
+                        <strong>${esc(e.name)}</strong>
+                        <div class="meta">${esc(time)} · ${esc(e.venueName)}</div>
+                        ${genre ? `<div class="meta">🎵 ${esc(genre)}</div>` : ''}
+                        ${e.url ? `<a href="${esc(e.url)}" target="_blank">Tickets →</a>` : ''}
+                        <br><button class="chip plan-btn" data-e="${i}">🌙 Plan my night</button>
+                     </div>`;
+        });
+
+
+        html += '<h2>🍻 Bars, pubs & clubs</h2>';
+        if (current.venuesLoading && current.venues.length === 0) html += '<p class="meta">⏳ Loading bars…</p>';
+        else if (venues.length === 0) html += '<p class="meta">Nothing found. Try a bigger distance or turn off a filter.</p>';
+        venues.forEach((v, i) => {
+            const dist = me && v._dist !== Infinity ? `<div class="meta">📍 ${fmtDist(v._dist)}</div>` : '';
+            html += `<div class="card" data-i="${i}">
+                        <strong>${esc(v.name)}</strong>
+                        <div class="meta">${esc(v.type)}${v.street ? ' · ' + esc(v.street) + ' ' + esc(v.houseNumber ?? '') : ''}</div>
+                        ${nowLine(v)}
+                        ${dist}
+                     </div>`;
+            if (lat(v) != null) {
+                v._marker = L.marker([lat(v), lon(v)])
+                    .bindPopup(`<b>${esc(v.name)}</b><br>${esc(v.type)}<br>${nowLine(v)}`)
+                    .bindTooltip(tooltipHtml(v), {direction: 'top', offset: [0, -12]})
+                    .addTo(markers);
+                v._marker.on('mouseover', () => loadWikidataPhoto(v));
+            }
+        });
+        list.innerHTML = html;
+        list.querySelectorAll('.plan-btn').forEach(b => b.onclick = () => planNight(events[b.dataset.e]));
+
+        list.querySelectorAll('.card[data-i]').forEach(card => {
+            card.onclick = () => {
+                const v = venues[card.dataset.i];
+                if (v._marker) { map.setView(v._marker.getLatLng(), 17); v._marker.openPopup(); }
+            };
+        });
+
+        const openCount = current.venues.filter(v => v._tonight.state === 'open').length;
+        const openNowCount = (me && nearby ? nearby : current.venues).filter(v => v.openNow === true).length;
+        const where = me ? ` within ${radius() >= 1000 ? radius() / 1000 + ' km' : radius() + ' m'}` : '';
+        document.getElementById('status').textContent =
+            `${current.events.length} events · ${venues.length} places${where} (${openNowCount} open now, ${openCount} known open tonight)`;
+    }
+
+    // Buttons
+    document.getElementById('go').onclick = () => { clearMe(); search(); };
+    document.getElementById('city').addEventListener('keydown', e => {
+        if (e.key === 'Enter') { clearMe(); search(); }
+    });
+    document.getElementById('nearMe').onclick = nearMe;
+    document.getElementById('radius').onchange = async () => {
+        if (!me) return;
+        showMe();
+        try { await loadNearby(); } catch (e) { document.getElementById('status').textContent = 'Could not load places: ' + e.message; return; }
+        draw();
+    };
+    document.getElementById('onlyOpen').onchange = draw;
+    document.getElementById('openNowOnly').onchange = async () => {
+        if (me) {   // near me: let the server filter (open=true), so you get up to 200 open places
+            try { await loadNearby(); } catch (e) { document.getElementById('status').textContent = 'Could not load places: ' + e.message; return; }
+        }
+        draw();
+    };
+    document.getElementById('nameSearch').oninput = draw;
+</script>
+</body>
+</html>
